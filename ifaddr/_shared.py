@@ -22,9 +22,9 @@
 import ctypes
 import socket
 import ipaddress
-import platform
+from dataclasses import dataclass
 
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
 
 class Adapter(object):
@@ -38,7 +38,9 @@ class Adapter(object):
     a IPv4 and an IPv6 IP address.
     """
 
-    def __init__(self, name: str, nice_name: str, ips: List['IP'], index: Optional[int] = None) -> None:
+    def __init__(
+        self, name: str, nice_name: str, ips: List['IP'], index: Optional[int] = None, multicast: bool = True
+    ) -> None:
 
         #: Unique name that identifies the adapter in the system.
         #: On Linux this is of the form of `eth0` or `eth0:1`, on
@@ -58,17 +60,31 @@ class Adapter(object):
         #: Adapter index as used by some API (e.g. IPv6 multicast group join).
         self.index = index
 
+        #: If this adapter supports multicast
+        self.multicast = multicast
+
     def __repr__(self) -> str:
-        return "Adapter(name={name}, nice_name={nice_name}, ips={ips}, index={index})".format(
-            name=repr(self.name), nice_name=repr(self.nice_name), ips=repr(self.ips), index=repr(self.index)
+        return "Adapter(name={name}, nice_name={nice_name}, ips={ips}, index={index}, multicast={multicast})".format(
+            name=repr(self.name),
+            nice_name=repr(self.nice_name),
+            ips=repr(self.ips),
+            index=repr(self.index),
+            multicast=repr(self.multicast),
         )
 
 
-# Type of an IPv4 address (a string in "xxx.xxx.xxx.xxx" format)
-_IPv4Address = str
+# Technically we don't need this wrapper but when dealing with an IPv4, IPv6 union it's nice
+# to be able to unconditionally access the "address" property on it.
+@dataclass
+class IPv4Ext:
+    address: ipaddress.IPv4Address
 
-# Type of an IPv6 address (a three-tuple `(ip, flowinfo, scope_id)`)
-_IPv6Address = Tuple[str, int, int]
+
+@dataclass
+class IPv6Ext:
+    address: ipaddress.IPv6Address
+    flowinfo: int
+    scope_id: int
 
 
 class IP(object):
@@ -76,14 +92,13 @@ class IP(object):
     Represents an IP address of an adapter.
     """
 
-    def __init__(self, ip: Union[_IPv4Address, _IPv6Address], network_prefix: int, nice_name: str) -> None:
-
+    def __init__(self, ip: Union[IPv4Ext, IPv6Ext], network_prefix: int, nice_name: str) -> None:
         #: IP address. For IPv4 addresses this is a string in
         #: "xxx.xxx.xxx.xxx" format. For IPv6 addresses this
         #: is a three-tuple `(ip, flowinfo, scope_id)`, where
         #: `ip` is a string in the usual collon separated
         #: hex format.
-        self.ip = ip
+        self.ip = (str(ip.address), ip.flowinfo, ip.scope_id) if isinstance(ip, IPv6Ext) else str(ip.address)
 
         #: Number of bits of the IP that represent the
         #: network. For a `255.255.255.0` netmask, this
@@ -118,8 +133,9 @@ class IP(object):
         )
 
 
-if platform.system() == "Darwin" or "BSD" in platform.system():
+import sys
 
+if sys.platform == "darwin" or sys.platform.startswith("freebsd") or sys.platform.startswith("openbsd"):
     # BSD derived systems use marginally different structures
     # than either Linux or Windows.
     # I still keep it in `shared` since we can use
@@ -153,10 +169,10 @@ if platform.system() == "Darwin" or "BSD" in platform.system():
 
 else:
 
-    class sockaddr(ctypes.Structure):  # type: ignore
+    class sockaddr(ctypes.Structure):
         _fields_ = [('sa_familiy', ctypes.c_uint16), ('sa_data', ctypes.c_uint8 * 14)]
 
-    class sockaddr_in(ctypes.Structure):  # type: ignore
+    class sockaddr_in(ctypes.Structure):
         _fields_ = [
             ('sin_familiy', ctypes.c_uint16),
             ('sin_port', ctypes.c_uint16),
@@ -164,7 +180,7 @@ else:
             ('sin_zero', ctypes.c_uint8 * 8),
         ]
 
-    class sockaddr_in6(ctypes.Structure):  # type: ignore
+    class sockaddr_in6(ctypes.Structure):
         _fields_ = [
             ('sin6_familiy', ctypes.c_uint16),
             ('sin6_port', ctypes.c_uint16),
@@ -174,26 +190,34 @@ else:
         ]
 
 
-def sockaddr_to_ip(sockaddr_ptr: 'ctypes.pointer[sockaddr]') -> Optional[Union[_IPv4Address, _IPv6Address]]:
+def sockaddr_to_ip(sockaddr_ptr: ctypes._Pointer) -> Optional[Union[IPv4Ext, IPv6Ext]]:
     if sockaddr_ptr:
-        if sockaddr_ptr[0].sa_familiy == socket.AF_INET:
-            ipv4 = ctypes.cast(sockaddr_ptr, ctypes.POINTER(sockaddr_in))
-            ippacked = bytes(bytearray(ipv4[0].sin_addr))
-            ip = str(ipaddress.ip_address(ippacked))
-            return ip
-        elif sockaddr_ptr[0].sa_familiy == socket.AF_INET6:
-            ipv6 = ctypes.cast(sockaddr_ptr, ctypes.POINTER(sockaddr_in6))
-            flowinfo = ipv6[0].sin6_flowinfo
-            ippacked = bytes(bytearray(ipv6[0].sin6_addr))
-            ip = str(ipaddress.ip_address(ippacked))
-            scope_id = ipv6[0].sin6_scope_id
-            return (ip, flowinfo, scope_id)
+        if sockaddr_ptr.contents.sa_familiy == socket.AF_INET:
+            ipv4 = ctypes.cast(sockaddr_ptr, ctypes.POINTER(sockaddr_in)).contents
+            ippacked = bytes(ipv4.sin_addr)
+            return IPv4Ext(ipaddress.IPv4Address(ippacked))
+        elif sockaddr_ptr.contents.sa_familiy == socket.AF_INET6:
+            ipv6 = ctypes.cast(sockaddr_ptr, ctypes.POINTER(sockaddr_in6)).contents
+            ippacked = bytes(ipv6.sin6_addr)
+            return IPv6Ext(
+                address=ipaddress.IPv6Address(ippacked),
+                flowinfo=ipv6.sin6_flowinfo,
+                scope_id=ipv6.sin6_scope_id,
+            )
     return None
+
+
+def sockaddr_to_ip_strict(sockaddr_ptr: ctypes._Pointer) -> Union[IPv4Ext, IPv6Ext]:
+    """A version of sockaddr_to_ip that raises an exception instead of returning None."""
+    result = sockaddr_to_ip(sockaddr_ptr)
+    assert result is not None
+    return result
 
 
 def ipv6_prefixlength(address: ipaddress.IPv6Address) -> int:
     prefix_length = 0
+    address_as_int = int(address)
     for i in range(address.max_prefixlen):
-        if int(address) >> i & 1:
+        if address_as_int >> i & 1:
             prefix_length = prefix_length + 1
     return prefix_length
